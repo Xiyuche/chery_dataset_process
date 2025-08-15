@@ -191,7 +191,7 @@ def generate_dynamic_mask(
         center = np.array(obj['obj_center_pos'])
         size = np.array(obj['size'])
         quat = np.array(obj['obj_rotation'])
-        R = Rotation.from_quat([quat[3], quat[0], quat[1], quat[2]]).as_matrix()
+        R = Rotation.from_quat([ quat[0], quat[1], quat[2], quat[3]]).as_matrix()
         corners = np.array([
             [1, 1, 1], [1, 1, -1], [1, -1, 1], [1, -1, -1],
             [-1, 1, 1], [-1, 1, -1], [-1, -1, 1], [-1, -1, -1]
@@ -881,24 +881,24 @@ def save_ego_pose(pose: np.ndarray, save_path: str) -> None:
 
 
 if __name__ == "__main__":
-    from multiprocessing import Pool, cpu_count
-    chery_clip_root = "/home/yuhan/yuhan/chery/A车/高速"
-    output_root = "/home/yuhan/yuhan/chery_gs6"
-    clips = [clip_name for clip_name in os.listdir(chery_clip_root) if clip_name.startswith('clip_')]
+    # from multiprocessing import Pool, cpu_count
+    # chery_clip_root = "/home/yuhan/yuhan/chery/A车/高速"
+    # output_root = "/home/yuhan/yuhan/chery_gs6"
+    # clips = [clip_name for clip_name in os.listdir(chery_clip_root) if clip_name.startswith('clip_')]
 
-    def process_one_clip(clip_name):
-        chery_clip_dir = os.path.join(chery_clip_root, clip_name)
-        output_dir = os.path.join(output_root, clip_name)
-        print(f"Processing clip: {chery_clip_dir} -> {output_dir}")
-        preprocess_chery_clip(chery_clip_dir, output_dir)
-        print(f"Finished processing clip: {chery_clip_dir} -> {output_dir}")
+    # def process_one_clip(clip_name):
+    #     chery_clip_dir = os.path.join(chery_clip_root, clip_name)
+    #     output_dir = os.path.join(output_root, clip_name)
+    #     print(f"Processing clip: {chery_clip_dir} -> {output_dir}")
+    #     preprocess_chery_clip(chery_clip_dir, output_dir)
+    #     print(f"Finished processing clip: {chery_clip_dir} -> {output_dir}")
 
-    with Pool(min(cpu_count(), 16)) as pool:
-        pool.map(process_one_clip, clips)
-    print("所有clips处理完成！")
+    # with Pool(min(cpu_count(), 16)) as pool:
+    #     pool.map(process_one_clip, clips)
+    # print("所有clips处理完成！")
     # 使用示例
-    # chery_clip_dir = "/home/yuhan/yuhan/chery/A车/城市/clip_1717055347001"
-    # # chery_clip_dir = "/home/yuhan/yuhan/chery/B车/城市/clip_1744499330800"
-    # output_dir = "/home/yuhan/yuhan/chery_gs2/clip_1717055347001"
-    # # 预处理单个clip
-    # preprocess_chery_clip(chery_clip_dir, output_dir)
+    chery_clip_dir = "/home/yuhan/yuhan/chery/A车/城市/clip_1717055347001"
+    # chery_clip_dir = "/home/yuhan/yuhan/chery/B车/城市/clip_1744499330800"
+    output_dir = "./test_gs_chery"
+    # 预处理单个clip
+    preprocess_chery_clip(chery_clip_dir, output_dir)
