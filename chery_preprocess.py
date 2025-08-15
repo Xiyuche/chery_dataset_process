@@ -10,7 +10,57 @@ from PIL import Image, ImageDraw
 from tqdm import tqdm
 from scipy.spatial import ConvexHull
 from scipy.spatial.transform import Rotation
+import math
+import cv2
+def calculate_horizontal_fov105_fx(fx, fy, w=3840, h=2160):
+    fov105_radians = 105 / 180 * math.pi
+    fov105_fx = w / 2 / math.tan(fov105_radians / 2)
+    fov105_fy = (fov105_fx / fx) * fy
+    return fov105_fx, fov105_fy
+def undistort_cam0_to_fov105(K, W, H):
+    K = np.float64(K)
+    fx, fy, cx, cy = K[0][0], K[1][1], K[0][2], K[1][2]
+    fov105_fx, fov105_fy = calculate_horizontal_fov105_fx(fx, fy, W, H)
+    fov105_intrinsic = np.eye(3)
+    fov105_intrinsic[0][0] = fov105_fx
+    fov105_intrinsic[1][1] = fov105_fy
+    fov105_intrinsic[0][2] = cx
+    fov105_intrinsic[1][2] = cy
+    new_K = fov105_intrinsic
+    return new_K
+def undistort_img(image, distort_f, k_9nums, camera, interplt=cv2.INTER_LINEAR):
+    assert k_9nums is not None
+    assert distort_f is not None
+    assert len(distort_f) in [4, 5, 8]  # fisheye 4, pinhole 5 or 8
+    #assert camera in CAMERA_TYPE_MAPPING
+    k_9nums = np.float64(k_9nums)
+    if k_9nums.shape != (3, 3):
+        K = k_9nums.reshape((3, 3))     # the intrinsic
+    else:
+        K = k_9nums
+    distCoeffs = np.float64(distort_f)
 
+    if isinstance(image, str):
+        img = cv2.imread(image, cv2.IMREAD_UNCHANGED)
+    elif isinstance(image, np.ndarray):
+        img = image
+    else:
+        raise ValueError(f'Wrong value of image, type(image): {type(image)}')
+    w, h = img.shape[1], img.shape[0]
+
+    new_size = (w, h)
+    new_K = K
+    if camera == "camera0":
+        new_K = undistort_cam0_to_fov105(K, w, h)
+    # use the raw intrinsic in undistortion
+    if len(distort_f) in [5, 8]:
+        mapx, mapy = cv2.initUndistortRectifyMap(K, distCoeffs, None, new_K, new_size, cv2.CV_32FC1)
+        img_undist = cv2.remap(img, mapx, mapy, interpolation=interplt)
+    else:
+        mapx, mapy = cv2.fisheye.initUndistortRectifyMap(K, distCoeffs, np.eye(3), new_K, new_size, cv2.CV_16SC2)
+        img_undist = cv2.remap(img, mapx, mapy, interpolation=interplt, borderMode=cv2.BORDER_CONSTANT)
+    
+    return img_undist, new_K
 
 def save_image(image: Image.Image, path: str) -> None:
     """保存图像文件"""
@@ -51,6 +101,8 @@ def interpolate_annotations(anno_dir: str, anno_files: List[str], target_ts: int
             ts = int(anno_file.split('_')[1].split('.')[0])
             with open(os.path.join(anno_dir, anno_file), 'r') as f:
                 anno = json.load(f)
+                anno = anno.get('3d_city_object_detection_with_fish_eye_annotated_info', anno.get('3d_highway_object_detection_with_fish_eye_annotated_info', anno))
+
             if 'annotated_info' in anno and '3d_object_detection_info' in anno['annotated_info']:
                 ts_list.append(ts)
                 anno_list.append(anno['annotated_info']['3d_object_detection_info']['3d_object_detection_anns_info'])
@@ -93,7 +145,8 @@ def generate_dynamic_mask(
     image_size: Tuple[int, int],
     annotations: List[Dict],
     camera_id: int,
-    chery_clip_dir: str
+    chery_clip_dir: str,
+    undistort_params: dict = None
 ) -> Image.Image:
     """
     根据3D标注生成动态目标掩码
@@ -105,25 +158,35 @@ def generate_dynamic_mask(
     cam_name = reverse_mapping.get(camera_id)
     if not cam_name:
         raise ValueError(f"未知的相机ID: {camera_id}")
-    intr_patterns = [
-        os.path.join(chery_clip_dir, 'intrinsics', f'{cam_name}.yaml'),
-        os.path.join(chery_clip_dir, 'intrinsics', f'{cam_name}_camera.yaml')
-    ]
-    intr_file = None
-    for pattern in intr_patterns:
-        if os.path.exists(pattern):
-            intr_file = pattern
-            break
-    if not intr_file:
-        raise FileNotFoundError(f"找不到相机 {cam_name} 的内参文件")
+    # 使用undistort_params
+    if undistort_params and camera_id in undistort_params:
+        K_new = undistort_params[camera_id]['K_new']
+        img_size = undistort_params[camera_id]['img_size']
+        # map1/map2可用于后续mask去畸变（如需）
+    else:
+        print(f"使用相机 {cam_name} 的原始内参")
+        # fallback: 仍然读取原始K
+        intr_patterns = [
+            os.path.join(chery_clip_dir, 'intrinsics', f'{cam_name}.yaml'),
+            os.path.join(chery_clip_dir, 'intrinsics', f'{cam_name}_camera.yaml')
+        ]
+        intr_file = None
+        for pattern in intr_patterns:
+            if os.path.exists(pattern):
+                intr_file = pattern
+                break
+        if not intr_file:
+            raise FileNotFoundError(f"找不到相机 {cam_name} 的内参文件")
+        with open(intr_file, 'r') as f:
+            intrinsics = yaml.safe_load(f)
+        K_new = np.array(intrinsics['K'])
+        img_size = image_size
     cam_name_for_extr = cam_name.replace('_', '')
     extr_path = os.path.join(chery_clip_dir, 'extrinsics', 'lidar2camera', f'lidar2{cam_name_for_extr}.yaml')
     if not os.path.exists(extr_path):
         raise FileNotFoundError(f"找不到相机 {cam_name} 的外参文件：{extr_path}")
-    with open(intr_file, 'r') as f:
-        intrinsics = yaml.safe_load(f)
     T_lidar2cam = read_transform_yaml(extr_path)
-    K = np.array(intrinsics['K'])
+    K = K_new
     for obj in annotations:
         center = np.array(obj['obj_center_pos'])
         size = np.array(obj['size'])
@@ -138,7 +201,7 @@ def generate_dynamic_mask(
         corners_cam = (T_lidar2cam @ corners_h.T).T[:, :3]
         if np.any(corners_cam[:, 2] < 0):
             continue
-        fx, fy, cx, cy = K
+        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
         u = cx + fx * corners_cam[:, 0] / corners_cam[:, 2]
         v = cy + fy * corners_cam[:, 1] / corners_cam[:, 2]
         points = [(int(u[i]), int(v[i])) for i in range(8)]
@@ -202,7 +265,7 @@ def process_camera_params(chery_clip_dir: str, output_dir: str, undistort_fov: f
                 intr = yaml.safe_load(f)
             K = intr['K']  # [f_u, f_v, c_u, c_v]
             D = intr['D']  # [k1, k2, p1, p2] 或更多
-            D_pad = D + [0.0] * (5 - len(D))
+            D_pad = D #+ [0.0] * (5 - len(D))
             
 
             # 计算去畸变参数和新内参（FOV=undistort_fov）
@@ -212,45 +275,37 @@ def process_camera_params(chery_clip_dir: str, output_dir: str, undistort_fov: f
             if 'width' in intr and 'height' in intr:
                 img_w = intr['width']
                 img_h = intr['height']
+                # print(f"相机 {cam_name} 图像分辨率: {img_w}x{img_h}")
+            else:
+                print(f"警告: 相机 {cam_name} 没有指定图像分辨率，使用默认值 {img_w}x{img_h}")
 
             # 特殊处理：相机0裁剪掉底部1/3区域
-            if cam_id == 0:
-                original_h = img_h
-                img_h = int(img_h * 3 / 4)  # 裁剪掉底部1/3
-                K[3] = K[3] * 3 / 4  # 调整主点 c_v，保持相对位置不变
+            # if cam_id == 0:
+            #     original_h = img_h
+            #     img_h = int(img_h * 4 / 5)  # 裁剪掉底部1/3
+            #     K[3] = K[3] * 4 / 5  # 调整主点 c_v，保持相对位置不变
 
             img_size = (img_w, img_h)
             img_size = (img_w, img_h)
             K_cv = np.array([[K[0], 0, K[2]], [0, K[1], K[3]], [0, 0, 1]])
-            D_cv = np.array(D_pad[:5])
+            D_cv = np.array(D_pad[:4])
 
-            # 计算新的内参矩阵以适配目标FOV
-            # 计算新的焦距
-            if cam_id not in [1]:
-                fov_rad = np.deg2rad(undistort_fov)
-                new_f = (img_w / 2) / np.tan(fov_rad / 2)
-                K_new = np.array([[new_f, 0, img_w / 2], [0, new_f, img_h / 2], [0, 0, 1]])
+            # 新实现：直接保存K_new和D，供undistort_img使用
+            if cam_id == 0:
+                new_K = undistort_cam0_to_fov105(K_cv, img_w, img_h)
             else:
-                # 对于主相机，保持原始内参
-                K_new = K_cv.copy()
-            
-            intr_array = np.array(K + [0]*5)
+                new_K = K_cv.copy()
+            undistort_params[cam_id] = {
+                'K_new': new_K,
+                'D': D_cv,
+                'img_size': img_size,
+                'cam_name': cam_name
+            }
+            intr_array = np.array([new_K[0, 0], new_K[1, 1], new_K[0, 2], new_K[1, 2], 0, 0, 0, 0, 0])
             save_camera_intrinsics(
                 intr_array,
                 os.path.join(output_dir, 'intrinsics', f'{cam_id}.txt')
             )
-            # K_new = K_cv
-            # 计算去畸变映射
-            map1, map2 = cv2.initUndistortRectifyMap(
-                K_cv, D_cv, None, K_new, img_size, cv2.CV_16SC2
-            )
-            undistort_params[cam_id] = {
-                'K_new': K_new,
-                'map1': map1,
-                'map2': map2,
-                'img_size': img_size
-            }
-       
         cam_name_for_extr = cam_name.replace('_', '').replace('camera', '')
         extr_path = os.path.join(extrinsics_dir, 'lidar2camera', f'lidar2{cam_name_for_extr}.yaml')
         if os.path.exists(extr_path):
@@ -299,18 +354,18 @@ def process_images(sample_path: str, chery_clip_dir: str, output_dir: str, times
         img_path = img_files[0]
         image = Image.open(img_path)
 
-        # 去畸变处理
+        # 新去畸变实现
         if undistort_params and cam_id in undistort_params:
+            cam_param = undistort_params[cam_id]
             img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            map1 = undistort_params[cam_id]['map1']
-            map2 = undistort_params[cam_id]['map2']
-            img_undist = cv2.remap(img_cv, map1, map2, interpolation=cv2.INTER_LINEAR)
+            cam_name = cam_param.get('cam_name', f'camera{cam_id}')
+            img_undist, _ = undistort_img(img_cv, cam_param['D'], cam_param['K_new'], cam_name)
             image = Image.fromarray(cv2.cvtColor(img_undist, cv2.COLOR_BGR2RGB))
         # 裁剪底部 1/3，仅限相机0
-        if cam_id == 0:
-            w, h = image.size
-            crop_h = int(h * 3 / 4)
-            image = image.crop((0, 0, w, crop_h))
+        # if cam_id == 0:
+        #     w, h = image.size
+        #     crop_h = int(h * 4 / 5)
+        #     image = image.crop((0, 0, w, crop_h))
 
         save_image(
             image,
@@ -320,7 +375,9 @@ def process_images(sample_path: str, chery_clip_dir: str, output_dir: str, times
         # 1.2 生成dynamic mask
         try:
             img_timestamp = int(os.path.basename(img_path).split('_')[1].split('.')[0])
-            anno_dir = os.path.join(chery_clip_dir, 'annotation', '3d_city_object_detection_with_fish_eye')
+            anno_root = os.path.join(chery_clip_dir, 'annotation')
+            anno_dir = glob.glob(os.path.join(anno_root, '3d_*_object_detection_with_fish_eye'))[0]
+            # anno_dir = os.path.join(chery_clip_dir, 'annotation', '3d_city_object_detection_with_fish_eye')
             anno_files = sorted([f for f in os.listdir(anno_dir) if f.startswith('sample_') and f.endswith('.json')])
             annotations = interpolate_annotations(anno_dir, anno_files, img_timestamp)
             if annotations:
@@ -328,7 +385,8 @@ def process_images(sample_path: str, chery_clip_dir: str, output_dir: str, times
                     image.size,
                     annotations,
                     cam_id,
-                    chery_clip_dir
+                    chery_clip_dir,
+                    undistort_params=undistort_params
                 )
                 save_image(
                     dynamic_mask,
@@ -387,12 +445,12 @@ def process_lidar(sample_path: str, chery_clip_dir: str, output_dir: str,
             continue
     
     if lidar_data:
-        print(f"\n合并所有激光雷达数据，总计 {total_points} 个点")
+        # print(f"\n合并所有激光雷达数据，总计 {total_points} 个点")
         try:
             combined_data = np.concatenate(lidar_data, axis=0)
             save_path = os.path.join(output_dir, 'lidar', f'{timestep:03d}.bin')
             save_lidar_data(combined_data, save_path)
-            print(f"保存数据到: {save_path}")
+            # print(f"保存数据到: {save_path}")
         except Exception as e:
             print(f"保存合并数据时出错: {str(e)}")
     else:
@@ -533,7 +591,7 @@ def interpolate_pose(ts_pose: List[Tuple[int, np.ndarray]],
     try:
         sample_ts = int(sample_name.split('_')[1])
         sample_ts = sample_ts / 1000000.0  # 转换为秒
-        print(f"Processing timestamp: {sample_ts}")
+        # print(f"Processing timestamp: {sample_ts}")
     except (IndexError, ValueError):
         print(f"Warning: 无法解析时间戳 {sample_name}，使用第一个位姿")
         return ts_pose[0][1]  # 无法解析时间戳，返回第一个位姿
@@ -603,7 +661,7 @@ def convert_pose_dict_to_matrix(pose_dict):
 
     # 3. 共轭变换
     T_waymo = R_transform @ T_utm @ np.linalg.inv(R_transform)
-
+    # T_waymo = T_utm
     return T_waymo
 
 
@@ -622,7 +680,7 @@ def preprocess_chery_clip(chery_clip_dir: str, output_dir: str) -> None:
     sample_dirs = sorted([d for d in os.listdir(chery_clip_dir) if d.startswith('sample_')])
     # 4. 处理每个时间戳的数据
     for timestep, sample_name in enumerate(sample_dirs):
-        print(f"Processing frame {timestep}: {sample_name}")
+        # print(f"Processing frame {timestep}: {sample_name}")
         sample_path = os.path.join(chery_clip_dir, sample_name)
         # 4.1 处理图像及相关masks（传入去畸变参数）
         process_images(sample_path, chery_clip_dir, output_dir, timestep, undistort_params=undistort_params)
@@ -823,8 +881,24 @@ def save_ego_pose(pose: np.ndarray, save_path: str) -> None:
 
 
 if __name__ == "__main__":
+    from multiprocessing import Pool, cpu_count
+    chery_clip_root = "/home/yuhan/yuhan/chery/A车/高速"
+    output_root = "/home/yuhan/yuhan/chery_gs6"
+    clips = [clip_name for clip_name in os.listdir(chery_clip_root) if clip_name.startswith('clip_')]
+
+    def process_one_clip(clip_name):
+        chery_clip_dir = os.path.join(chery_clip_root, clip_name)
+        output_dir = os.path.join(output_root, clip_name)
+        print(f"Processing clip: {chery_clip_dir} -> {output_dir}")
+        preprocess_chery_clip(chery_clip_dir, output_dir)
+        print(f"Finished processing clip: {chery_clip_dir} -> {output_dir}")
+
+    with Pool(min(cpu_count(), 16)) as pool:
+        pool.map(process_one_clip, clips)
+    print("所有clips处理完成！")
     # 使用示例
-    chery_clip_dir = "/home/yuhan/yuhan/chery/A车/城市/clip_1717061169799"
-    output_dir = "/home/yuhan/yuhan/gs_test24"
-    # 预处理单个clip
-    preprocess_chery_clip(chery_clip_dir, output_dir)
+    # chery_clip_dir = "/home/yuhan/yuhan/chery/A车/城市/clip_1717055347001"
+    # # chery_clip_dir = "/home/yuhan/yuhan/chery/B车/城市/clip_1744499330800"
+    # output_dir = "/home/yuhan/yuhan/chery_gs2/clip_1717055347001"
+    # # 预处理单个clip
+    # preprocess_chery_clip(chery_clip_dir, output_dir)
