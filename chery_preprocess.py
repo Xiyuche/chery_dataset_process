@@ -1,0 +1,830 @@
+
+import os
+import sys
+import glob
+import json
+import yaml
+import numpy as np
+from typing import List, Tuple, Dict, Optional
+from PIL import Image, ImageDraw
+from tqdm import tqdm
+from scipy.spatial import ConvexHull
+from scipy.spatial.transform import Rotation
+
+
+def save_image(image: Image.Image, path: str) -> None:
+    """保存图像文件"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    image.save(path)
+
+
+def save_camera_intrinsics(intrinsics: np.ndarray, path: str) -> None:
+    """保存相机内参"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savetxt(path, intrinsics)
+
+
+def save_camera_extrinsics(extrinsics: np.ndarray, path: str) -> None:
+    """保存相机外参"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    np.savetxt(path, extrinsics)
+
+
+def create_output_dirs(output_dir: str) -> None:
+    """创建输出目录结构"""
+    subdirs = [
+        'images', 'lidar', 'ego_pose', 'extrinsics',
+        'intrinsics', 'dynamic_masks', 'sky_masks'
+    ]
+    for subdir in subdirs:
+        os.makedirs(os.path.join(output_dir, subdir), exist_ok=True)
+
+
+def interpolate_annotations(anno_dir: str, anno_files: List[str], target_ts: int) -> Optional[List[Dict]]:
+    """
+    根据目标时间戳对3D标注进行插值
+    """
+    ts_list = []
+    anno_list = []
+    for anno_file in anno_files:
+        try:
+            ts = int(anno_file.split('_')[1].split('.')[0])
+            with open(os.path.join(anno_dir, anno_file), 'r') as f:
+                anno = json.load(f)
+            if 'annotated_info' in anno and '3d_object_detection_info' in anno['annotated_info']:
+                ts_list.append(ts)
+                anno_list.append(anno['annotated_info']['3d_object_detection_info']['3d_object_detection_anns_info'])
+        except Exception as e:
+            print(f"Error reading annotation file {anno_file}: {e}")
+            continue
+    if not ts_list:
+        return None
+    ts_array = np.array(ts_list)
+    idx = np.searchsorted(ts_array, target_ts)
+    if idx == 0:
+        return anno_list[0]
+    elif idx >= len(ts_array):
+        return anno_list[-1]
+    t0, t1 = ts_array[idx-1], ts_array[idx]
+    alpha = (target_ts - t0) / (t1 - t0)
+    interpolated = []
+    anno0, anno1 = anno_list[idx-1], anno_list[idx]
+    track_ids0 = {obj['track_id']: obj for obj in anno0}
+    track_ids1 = {obj['track_id']: obj for obj in anno1}
+    common_tracks = set(track_ids0.keys()) & set(track_ids1.keys())
+    for track_id in common_tracks:
+        obj0 = track_ids0[track_id]
+        obj1 = track_ids1[track_id]
+        pos0 = np.array(obj0['obj_center_pos'])
+        pos1 = np.array(obj1['obj_center_pos'])
+        pos = pos0 * (1 - alpha) + pos1 * alpha
+        rot0 = np.array(obj0['obj_rotation'])
+        rot1 = np.array(obj1['obj_rotation'])
+        rot = rot0 * (1 - alpha) + rot1 * alpha
+        rot = rot / np.linalg.norm(rot)
+        obj = obj0.copy()
+        obj['obj_center_pos'] = pos.tolist()
+        obj['obj_rotation'] = rot.tolist()
+        interpolated.append(obj)
+    return interpolated
+
+
+def generate_dynamic_mask(
+    image_size: Tuple[int, int],
+    annotations: List[Dict],
+    camera_id: int,
+    chery_clip_dir: str
+) -> Image.Image:
+    """
+    根据3D标注生成动态目标掩码
+    """
+    mask = Image.new('L', image_size, 0)
+    draw = ImageDraw.Draw(mask)
+    camera_mapping = get_camera_mapping()
+    reverse_mapping = {v: k for k, v in camera_mapping.items() if '_camera' not in k}
+    cam_name = reverse_mapping.get(camera_id)
+    if not cam_name:
+        raise ValueError(f"未知的相机ID: {camera_id}")
+    intr_patterns = [
+        os.path.join(chery_clip_dir, 'intrinsics', f'{cam_name}.yaml'),
+        os.path.join(chery_clip_dir, 'intrinsics', f'{cam_name}_camera.yaml')
+    ]
+    intr_file = None
+    for pattern in intr_patterns:
+        if os.path.exists(pattern):
+            intr_file = pattern
+            break
+    if not intr_file:
+        raise FileNotFoundError(f"找不到相机 {cam_name} 的内参文件")
+    cam_name_for_extr = cam_name.replace('_', '')
+    extr_path = os.path.join(chery_clip_dir, 'extrinsics', 'lidar2camera', f'lidar2{cam_name_for_extr}.yaml')
+    if not os.path.exists(extr_path):
+        raise FileNotFoundError(f"找不到相机 {cam_name} 的外参文件：{extr_path}")
+    with open(intr_file, 'r') as f:
+        intrinsics = yaml.safe_load(f)
+    T_lidar2cam = read_transform_yaml(extr_path)
+    K = np.array(intrinsics['K'])
+    for obj in annotations:
+        center = np.array(obj['obj_center_pos'])
+        size = np.array(obj['size'])
+        quat = np.array(obj['obj_rotation'])
+        R = Rotation.from_quat([quat[3], quat[0], quat[1], quat[2]]).as_matrix()
+        corners = np.array([
+            [1, 1, 1], [1, 1, -1], [1, -1, 1], [1, -1, -1],
+            [-1, 1, 1], [-1, 1, -1], [-1, -1, 1], [-1, -1, -1]
+        ]) * (size / 2)
+        corners = (R @ corners.T).T + center
+        corners_h = np.concatenate([corners, np.ones((8, 1))], axis=1)
+        corners_cam = (T_lidar2cam @ corners_h.T).T[:, :3]
+        if np.any(corners_cam[:, 2] < 0):
+            continue
+        fx, fy, cx, cy = K
+        u = cx + fx * corners_cam[:, 0] / corners_cam[:, 2]
+        v = cy + fy * corners_cam[:, 1] / corners_cam[:, 2]
+        points = [(int(u[i]), int(v[i])) for i in range(8)]
+        hull = ConvexHull(points)
+        hull_points = [points[i] for i in hull.vertices]
+        draw.polygon(hull_points, fill=255)
+    return mask
+
+def fix_camera_pose(T_orig):
+    """
+    输入一个 4x4 相机外参矩阵（Z-forward），输出转换到 Waymo 坐标系（X-forward）的版本。
+    """
+    T_fix = np.array([
+        [0, 0, 1],
+        [-1, 0, 0],
+        [0, -1, 0]
+    ])
+    R_orig = T_orig[:3, :3]
+    t_orig = T_orig[:3, 3]
+    R_new = T_fix @ R_orig
+    t_new = T_fix @ t_orig
+    T_new = np.eye(4)
+    T_new[:3, :3] = R_new
+    T_new[:3, 3] = t_new
+    return np.linalg.inv(T_new)
+
+def get_camera_mapping() -> Dict[str, int]:
+    """获取相机名称到ID的映射关系"""
+    mapping = {
+        "front_wide": 0, "front_main": 1, "left_front": 2, "left_rear": 3,
+        "right_front": 4, "right_rear": 5, "rear_main": 6,
+        "fisheye_left": 7, "fisheye_rear": 8, "fisheye_front": 9, "fisheye_right": 10
+    }
+    variants = {k + "_camera": v for k, v in mapping.items()}
+    mapping.update(variants)
+    return mapping
+
+def process_camera_params(chery_clip_dir: str, output_dir: str, undistort_fov: float = 60.0):
+    """处理相机参数（内参和外参），并计算去畸变参数，返回每个相机的去畸变映射和新内参"""
+    import cv2
+    intrinsics_dir = os.path.join(chery_clip_dir, 'intrinsics')
+    extrinsics_dir = os.path.join(chery_clip_dir, 'extrinsics')
+    cam_names = [f for f in os.listdir(intrinsics_dir) if f.endswith('.yaml')]
+    os.makedirs(os.path.join(output_dir, 'intrinsics'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'extrinsics'), exist_ok=True)
+
+    camera_mapping = get_camera_mapping()
+    undistort_params = {}  # cam_id: dict with 'K_new', 'map1', 'map2', 'img_size'
+
+    for cam_yaml in cam_names:
+        cam_name = cam_yaml.replace('.yaml', '')
+        try:
+            cam_id = camera_mapping[cam_name]
+        except KeyError:
+            print(f"警告: 未知的相机名称 {cam_name}，跳过处理")
+            continue
+
+        intr_path = os.path.join(intrinsics_dir, cam_yaml)
+        if os.path.exists(intr_path):
+            with open(intr_path, 'r') as f:
+                intr = yaml.safe_load(f)
+            K = intr['K']  # [f_u, f_v, c_u, c_v]
+            D = intr['D']  # [k1, k2, p1, p2] 或更多
+            D_pad = D + [0.0] * (5 - len(D))
+            
+
+            # 计算去畸变参数和新内参（FOV=undistort_fov）
+            # 假设图像分辨率由K的主点给出
+            img_w = int(K[2] * 2)
+            img_h = int(K[3] * 2)
+            if 'width' in intr and 'height' in intr:
+                img_w = intr['width']
+                img_h = intr['height']
+
+            # 特殊处理：相机0裁剪掉底部1/3区域
+            if cam_id == 0:
+                original_h = img_h
+                img_h = int(img_h * 3 / 4)  # 裁剪掉底部1/3
+                K[3] = K[3] * 3 / 4  # 调整主点 c_v，保持相对位置不变
+
+            img_size = (img_w, img_h)
+            img_size = (img_w, img_h)
+            K_cv = np.array([[K[0], 0, K[2]], [0, K[1], K[3]], [0, 0, 1]])
+            D_cv = np.array(D_pad[:5])
+
+            # 计算新的内参矩阵以适配目标FOV
+            # 计算新的焦距
+            if cam_id not in [1]:
+                fov_rad = np.deg2rad(undistort_fov)
+                new_f = (img_w / 2) / np.tan(fov_rad / 2)
+                K_new = np.array([[new_f, 0, img_w / 2], [0, new_f, img_h / 2], [0, 0, 1]])
+            else:
+                # 对于主相机，保持原始内参
+                K_new = K_cv.copy()
+            
+            intr_array = np.array(K + [0]*5)
+            save_camera_intrinsics(
+                intr_array,
+                os.path.join(output_dir, 'intrinsics', f'{cam_id}.txt')
+            )
+            # K_new = K_cv
+            # 计算去畸变映射
+            map1, map2 = cv2.initUndistortRectifyMap(
+                K_cv, D_cv, None, K_new, img_size, cv2.CV_16SC2
+            )
+            undistort_params[cam_id] = {
+                'K_new': K_new,
+                'map1': map1,
+                'map2': map2,
+                'img_size': img_size
+            }
+       
+        cam_name_for_extr = cam_name.replace('_', '').replace('camera', '')
+        extr_path = os.path.join(extrinsics_dir, 'lidar2camera', f'lidar2{cam_name_for_extr}.yaml')
+        if os.path.exists(extr_path):
+            extr_array = read_transform_yaml(extr_path)
+            extr_array = fix_camera_pose(extr_array)  # 转换到 Waymo 坐标系
+            save_camera_extrinsics(
+                extr_array,
+                os.path.join(output_dir, 'extrinsics', f'{cam_id}.txt')
+            )
+        else:
+            print(f"警告: 相机 {cam_id} 的外参文件不存在: {extr_path}")
+
+    return undistort_params
+
+def process_images(sample_path: str, chery_clip_dir: str, output_dir: str, timestep: int, undistort_params=None) -> None:
+    """
+    处理图像相关数据，包括图片、动态目标掩码和天空掩码
+    
+    Args:
+        sample_path: 当前帧的路径
+        chery_clip_dir: 数据根目录，用于查找标注文件
+        output_dir: 输出目录
+        timestep: 当前帧的序号
+    """
+    # 获取相机映射关系
+    camera_mapping = get_camera_mapping()
+    reverse_mapping = {v: k for k, v in camera_mapping.items() if '_camera' not in k}
+
+    # 1. 处理图像
+    import cv2
+    for cam_id in range(11):
+        img_patterns = [
+            os.path.join(sample_path, f'camera{cam_id}_*.jpg'),
+            os.path.join(sample_path, f'{reverse_mapping[cam_id]}_*.jpg'),
+            os.path.join(sample_path, f'{reverse_mapping[cam_id]}_camera_*.jpg'),
+        ]
+        img_files = []
+        for pattern in img_patterns:
+            img_files.extend(glob.glob(pattern))
+
+        img_files = [f for f in img_files if 'undist' not in f]  # 排除空字符串
+        if not img_files:
+            print(f"找不到相机 {cam_id} ({reverse_mapping[cam_id]}) 的图像文件")
+            continue
+
+        img_path = img_files[0]
+        image = Image.open(img_path)
+
+        # 去畸变处理
+        if undistort_params and cam_id in undistort_params:
+            img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            map1 = undistort_params[cam_id]['map1']
+            map2 = undistort_params[cam_id]['map2']
+            img_undist = cv2.remap(img_cv, map1, map2, interpolation=cv2.INTER_LINEAR)
+            image = Image.fromarray(cv2.cvtColor(img_undist, cv2.COLOR_BGR2RGB))
+        # 裁剪底部 1/3，仅限相机0
+        if cam_id == 0:
+            w, h = image.size
+            crop_h = int(h * 3 / 4)
+            image = image.crop((0, 0, w, crop_h))
+
+        save_image(
+            image,
+            os.path.join(output_dir, 'images', f'{timestep:03d}_{cam_id}.jpg')
+        )
+
+        # 1.2 生成dynamic mask
+        try:
+            img_timestamp = int(os.path.basename(img_path).split('_')[1].split('.')[0])
+            anno_dir = os.path.join(chery_clip_dir, 'annotation', '3d_city_object_detection_with_fish_eye')
+            anno_files = sorted([f for f in os.listdir(anno_dir) if f.startswith('sample_') and f.endswith('.json')])
+            annotations = interpolate_annotations(anno_dir, anno_files, img_timestamp)
+            if annotations:
+                dynamic_mask = generate_dynamic_mask(
+                    image.size,
+                    annotations,
+                    cam_id,
+                    chery_clip_dir
+                )
+                save_image(
+                    dynamic_mask,
+                    os.path.join(output_dir, 'dynamic_masks', f'{timestep:03d}_{cam_id}.png')
+                )
+        except Exception as e:
+            print(f"Error generating dynamic mask for {img_path}: {e}")
+
+        sky_path = os.path.join(chery_clip_dir, 'annotation', os.path.basename(img_path).replace('.jpg', '_sky.png'))
+        if os.path.exists(sky_path):
+            save_image(
+                Image.open(sky_path),
+                os.path.join(output_dir, 'sky_masks', f'{timestep:03d}_{cam_id}.png')
+            )
+        else:
+            pass
+
+def process_lidar(sample_path: str, chery_clip_dir: str, output_dir: str, 
+                 timestep: int) -> None:
+    """处理激光雷达数据"""
+    lidar_data = []
+    total_points = 0
+    
+    for lidar_idx in range(4):
+        # print(f"\n处理激光雷达 {lidar_idx}")
+        lidar_files = glob.glob(os.path.join(sample_path, f'lidar{lidar_idx}_*.pcd'))
+        
+        if not lidar_files:
+            print(f"未找到激光雷达 {lidar_idx} 的数据文件")
+            continue
+            
+        # print(f"找到文件: {lidar_files[0]}")
+        
+        try:
+            # 读取点云
+            pts = read_pcd_xyz(lidar_files[0])
+            if pts.shape[0] == 0:
+                print(f"激光雷达 {lidar_idx} 没有有效的点云数据")
+                continue
+                
+            # print(f"读取到 {pts.shape[0]} 个点")
+            
+            # 获取转换矩阵
+            trans_mat = get_lidar_transform(chery_clip_dir, lidar_idx)
+            # print(f"转换矩阵:\n{trans_mat}")
+            
+            # 转换点云并构造Waymo格式
+            waymo_data = convert_to_waymo_format(pts, trans_mat, lidar_idx)
+            # print(f"转换后数据: shape={waymo_data.shape}")
+            
+            lidar_data.append(waymo_data)
+            total_points += waymo_data.shape[0]
+            
+        except Exception as e:
+            print(f"处理激光雷达 {lidar_idx} 时出错: {str(e)}")
+            continue
+    
+    if lidar_data:
+        print(f"\n合并所有激光雷达数据，总计 {total_points} 个点")
+        try:
+            combined_data = np.concatenate(lidar_data, axis=0)
+            save_path = os.path.join(output_dir, 'lidar', f'{timestep:03d}.bin')
+            save_lidar_data(combined_data, save_path)
+            print(f"保存数据到: {save_path}")
+        except Exception as e:
+            print(f"保存合并数据时出错: {str(e)}")
+    else:
+        print("警告：没有有效的激光雷达数据可保存")
+
+def read_transform_yaml(yaml_path: str) -> np.ndarray:
+    """读取并解析YAML格式的转换矩阵
+    
+    Args:
+        yaml_path: YAML文件路径
+        
+    Returns:
+        4x4 转换矩阵，如果文件不存在则返回单位矩阵
+    """
+    if not os.path.exists(yaml_path):
+        return np.eye(4)
+        
+    with open(yaml_path, 'r') as f:
+        data = yaml.safe_load(f)
+    
+    # 处理不同的数据格式
+    if 'transform' in data:
+        if isinstance(data['transform'], dict) and 'rotation' in data['transform'] and 'translation' in data['transform']:
+            # 处理包含旋转和平移的字典格式
+            rot = data['transform']['rotation']
+            trans = data['transform']['translation']
+            
+            # 从四元数创建旋转矩阵
+            quat = np.array([rot['x'], rot['y'], rot['z'], rot['w']])
+            R = Rotation.from_quat([quat[3], quat[0], quat[1], quat[2]]).as_matrix()
+            
+            # 创建平移向量
+            t = np.array([trans['x'], trans['y'], trans['z']])
+            
+            # 构建4x4变换矩阵
+            transform = np.eye(4)
+            transform[:3, :3] = R
+            transform[:3, 3] = t
+        else:
+            transform = np.array(data['transform'])
+    elif 'data' in data:
+        transform = np.array(data['data']).reshape(4, 4)
+    else:
+        # 如果数据直接是矩阵格式
+        transform = np.array(data).reshape(4, 4)
+        
+    return transform
+
+def get_lidar_transform(chery_clip_dir: str, lidar_idx: int) -> np.ndarray:
+    """获取LiDAR到主LiDAR的转换矩阵"""
+    # 主LiDAR返回单位矩阵
+    if lidar_idx == 0:
+        return np.eye(4)
+    
+    # 根据索引获取对应的LiDAR名称
+    lidar_names = {
+        1: 'front',
+        2: 'left',
+        3: 'right'
+    }
+    
+    if lidar_idx not in lidar_names:
+        print(f"警告: 未知的激光雷达索引 {lidar_idx}，使用单位矩阵")
+        return np.eye(4)
+    
+    extr_path = os.path.join(chery_clip_dir, 'extrinsics', 'lidar2lidar', 
+                            f'{lidar_names[lidar_idx]}2mainlidar.yaml')
+    return read_transform_yaml(extr_path)
+
+def convert_to_waymo_format(pts: np.ndarray, trans_mat: np.ndarray, 
+                          lidar_idx: int) -> np.ndarray:
+    """将点云转换为Waymo格式"""
+    if pts.shape[0] == 0:
+        # 处理空点云的情况
+        return np.zeros((0, 10), dtype=np.float32)
+    
+    # 转换到主LiDAR坐标系
+    pts_h = np.concatenate([pts, np.ones((pts.shape[0], 1))], axis=1)
+    pts_trans = (trans_mat @ pts_h.T).T[:, :3]
+    
+    # 构造Waymo格式数组
+    N = pts_trans.shape[0]
+    arr = np.zeros((N, 10), dtype=np.float32)
+    # origins: LiDAR安装位置
+    lidar_origin = trans_mat[:3, 3]
+    # arr[:, 0:3] = np.tile(lidar_origin, (N, 1))
+    # arr[:, 3:6] = pts_trans  # points
+    # arr[:, 6:10] = 0  # flows
+    # arr[:, 10] = 0  # ground label
+    # arr[:, 11] = 0  # intensity
+    # arr[:, 12] = 0  # elongation
+    # arr[:, 13] = lidar_idx  # laser_id
+
+    arr[:, 0:3] = pts
+    arr[:, 3:6] = pts_trans  # points
+    # arr[:, 6:10] = 0  # flows
+    arr[:, 6] = 0  # ground label
+    arr[:, 7] = 0  # intensity
+    arr[:, 8] = 0  # elongation
+    arr[:, 9] = lidar_idx  # laser_id
+    return arr
+
+def process_ego_pose(chery_clip_dir: str, sample_name: str, output_dir: str, 
+                    timestep: int) -> None:
+    """处理ego位姿数据"""
+    pose_path = os.path.join(chery_clip_dir, 'localization.json')
+    if not os.path.exists(pose_path):
+        return
+        
+    with open(pose_path, 'r') as f:
+        poses = json.load(f)
+    # import pdb; pdb.set_trace() 
+    # 确保poses是列表
+    if not isinstance(poses, list):
+        if 'poses' in poses:
+            poses = poses['poses']
+        else:
+            print(f"Warning: Unexpected format in {pose_path}")
+            return
+    
+    # 获取时间戳对应的位姿（dict格式）
+    ts_pose = [(p["timestamp"], p["pose"]) for p in poses if "timestamp" in p and "pose" in p]
+    if not ts_pose:
+        print(f"No valid pose in {pose_path}")
+        return
+    # 处理时间戳和插值
+    pose_dict = interpolate_pose(ts_pose, sample_name)
+    
+    if pose_dict is not None:
+        # 转换为Waymo格式4x4矩阵
+        pose_dict['position']['z'] += 1.801
+        pose_mat = convert_pose_dict_to_matrix(pose_dict)
+        save_ego_pose(pose_mat, os.path.join(output_dir, 'ego_pose', f'{timestep:03d}.txt'))
+
+def interpolate_pose(ts_pose: List[Tuple[int, np.ndarray]], 
+                    sample_name: str) -> Optional[np.ndarray]:
+    """根据时间戳插值计算位姿"""
+    try:
+        sample_ts = int(sample_name.split('_')[1])
+        sample_ts = sample_ts / 1000000.0  # 转换为秒
+        print(f"Processing timestamp: {sample_ts}")
+    except (IndexError, ValueError):
+        print(f"Warning: 无法解析时间戳 {sample_name}，使用第一个位姿")
+        return ts_pose[0][1]  # 无法解析时间戳，返回第一个位姿
+    ts_list = [t for t, _ in ts_pose]
+    if sample_ts in ts_list:
+        return ts_pose[ts_list.index(sample_ts)][1]
+    # 找到最近的两个时间戳做线性插值（仅插值position和orientation）
+    ts_sorted = sorted(ts_pose, key=lambda x: x[0])
+    prev = next = None
+    for t, p in ts_sorted:
+        if t < sample_ts:
+            prev = (t, p)
+        elif t > sample_ts and next is None:
+            next = (t, p)
+            break
+    if prev and next:
+        alpha = (sample_ts - prev[0]) / (next[0] - prev[0])
+        # 插值position
+        pos0 = np.array([prev[1]['position']['x'], prev[1]['position']['y'], prev[1]['position']['z']])
+        pos1 = np.array([next[1]['position']['x'], next[1]['position']['y'], next[1]['position']['z']])
+        pos = pos0 * (1 - alpha) + pos1 * alpha
+        # 插值四元数（线性插值，或可用slerp）
+        quat0 = np.array([prev[1]['orientation']['qx'], prev[1]['orientation']['qy'], prev[1]['orientation']['qz'], prev[1]['orientation']['qw']])
+        quat1 = np.array([next[1]['orientation']['qx'], next[1]['orientation']['qy'], next[1]['orientation']['qz'], next[1]['orientation']['qw']])
+        quat = quat0 * (1 - alpha) + quat1 * alpha
+        quat = quat / np.linalg.norm(quat)
+        # 构造插值后的pose dict
+        pose_interp = prev[1].copy()
+        pose_interp['position'] = {'x': pos[0], 'y': pos[1], 'z': pos[2]}
+        pose_interp['orientation'] = {'qx': quat[0], 'qy': quat[1], 'qz': quat[2], 'qw': quat[3]}
+        return pose_interp
+    return prev[1] if prev else next[1] if next else ts_sorted[0][1]
+
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+def convert_pose_dict_to_matrix(pose_dict):
+    """
+    将 UTM 坐标系下的 pose dict 转换为 Waymo 坐标系下的 4x4 变换矩阵。
+    使用坐标系共轭变换方式，保证方向保持一致。
+    """
+
+    # 1. 从 pose_dict 构造原始的 4x4 变换矩阵（UTM 坐标系）
+    pos = pose_dict['position']
+    x, y, z = pos['x'], pos['y'], pos['z']
+    quat = pose_dict['orientation']
+    qx, qy, qz, qw = quat['qx'], quat['qy'], quat['qz'], quat['qw']
+    rot = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
+    
+    T_utm = np.eye(4)
+    T_utm[:3, :3] = rot
+    T_utm[:3, 3] = [x, y, z]
+
+    # 2. 定义坐标轴变换矩阵 R（将 ENU → Waymo）
+    # ENU: X=East, Y=North, Z=Up
+    # Waymo: X=Forward, Y=Left, Z=Up
+    # 所以我们需要将 ENU 坐标系旋转到 Waymo 坐标系：
+    # ENU (E, N, U) → Waymo (F, L, U) ≈ Waymo (N, -E, U)
+    R_axis = np.array([
+        [ 0,  1, 0],
+        [1,  0, 0],
+        [ 0,  0, 1]
+    ])  # 3x3
+
+    R_transform = np.eye(4)
+    R_transform[:3, :3] = R_axis
+
+    # 3. 共轭变换
+    T_waymo = R_transform @ T_utm @ np.linalg.inv(R_transform)
+
+    return T_waymo
+
+
+def preprocess_chery_clip(chery_clip_dir: str, output_dir: str) -> None:
+    """
+    预处理Chery数据集中的单个clip
+    
+    Args:
+        chery_clip_dir: Chery数据clip的根目录
+        output_dir: 输出目录路径
+    """
+    create_output_dirs(output_dir)
+    # 2. 处理相机参数（内参和外参），并获取去畸变参数
+    undistort_params = process_camera_params(chery_clip_dir, output_dir, undistort_fov=71.0)
+    # 3. 获取所有sample并按时间戳排序
+    sample_dirs = sorted([d for d in os.listdir(chery_clip_dir) if d.startswith('sample_')])
+    # 4. 处理每个时间戳的数据
+    for timestep, sample_name in enumerate(sample_dirs):
+        print(f"Processing frame {timestep}: {sample_name}")
+        sample_path = os.path.join(chery_clip_dir, sample_name)
+        # 4.1 处理图像及相关masks（传入去畸变参数）
+        process_images(sample_path, chery_clip_dir, output_dir, timestep, undistort_params=undistort_params)
+        # 4.2 处理LiDAR点云
+        process_lidar(sample_path, chery_clip_dir, output_dir, timestep)
+        # 4.3 处理ego位姿
+        process_ego_pose(chery_clip_dir, sample_name, output_dir, timestep)
+
+def read_pcd_xyz(pcd_path):
+    """
+    只读取pcd文件的xyz坐标，返回(N,3)数组。
+    支持ASCII和二进制格式的PCD文件。
+    """
+    try:
+        # 读取文件头部
+        header_data = {}
+        header_lines = []
+        with open(pcd_path, 'rb') as f:
+            while True:
+                line = f.readline()
+                try:
+                    decoded_line = line.decode('ascii', errors='ignore').strip()
+                    header_lines.append(decoded_line)
+                except Exception as e:
+                    print(f"警告：解码行时出错: {e}")
+                    continue
+
+                if not decoded_line:
+                    continue
+                    
+                if decoded_line.startswith('DATA'):
+                    header_data['data_format'] = decoded_line.split()[1]
+                    break
+                    
+                if decoded_line.startswith('#'):
+                    continue
+                    
+                tokens = decoded_line.split()
+                if len(tokens) >= 2:
+                    header_data[tokens[0]] = tokens[1:]
+                    
+
+        # 获取点云信息
+        try:
+            width = int(header_data.get('WIDTH', ['0'])[0])
+            height = int(header_data.get('HEIGHT', ['0'])[0])
+            points_num = width * height
+            
+            fields = header_data.get('FIELDS', ['x', 'y', 'z'])
+            sizes = [int(s) for s in header_data.get('SIZE', ['4'] * len(fields))]
+            types = header_data.get('TYPE', ['F'] * len(fields))
+            
+            # 验证必要的字段是否存在
+            if 'x' not in fields or 'y' not in fields or 'z' not in fields:
+                print(f"错误：缺少必要的坐标字段")
+                return np.zeros((0, 3), dtype=np.float32)
+        except Exception as e:
+            print(f"错误：解析点云信息时出错: {e}")
+            return np.zeros((0, 3), dtype=np.float32)
+        
+        # 计算字段偏移
+        field_offsets = {}
+        offset = 0
+        for field, size in zip(fields, sizes):
+            field_offsets[field] = offset
+            offset += size
+        point_size = offset
+        
+        # 检查是否为二进制格式
+        is_binary = header_data['data_format'].lower() == 'binary'
+        
+        if is_binary:
+            # 二进制格式
+            import struct
+            # 计算头部大小
+            with open(pcd_path, 'rb') as f:
+                header_size = 0
+                while True:
+                    line = f.readline()
+                    header_size += len(line)
+                    if b'DATA' in line:
+                        break
+                
+            # 读取点云数据
+            pts = []
+            with open(pcd_path, 'rb') as f:
+                # 跳过头部
+                f.seek(header_size)
+                
+                # 准备解包格式
+                fmt = ''
+                for t in types[:3]:  # 只读取xyz
+                    if t == 'F': fmt += 'f'
+                    elif t == 'D': fmt += 'd'
+                    elif t == 'I': fmt += 'i'
+                    elif t == 'U': fmt += 'I'
+                
+                # 读取数据
+                for _ in range(points_num):
+                    try:
+                        data = f.read(point_size)
+                        if len(data) < point_size:
+                            break
+                        
+                        # 只取xyz字段
+                        x = struct.unpack('f', data[field_offsets['x']:field_offsets['x']+4])[0]
+                        y = struct.unpack('f', data[field_offsets['y']:field_offsets['y']+4])[0]
+                        z = struct.unpack('f', data[field_offsets['z']:field_offsets['z']+4])[0]
+                        pts.append([x, y, z])
+                    except struct.error:
+                        break
+        else:
+            # ASCII格式
+            pts = []
+            with open(pcd_path, 'r') as f:
+                # 跳过头部
+                for line in f:
+                    if line.startswith('DATA'):
+                        break
+                # 读取点数据
+                for line in f:
+                    try:
+                        vals = line.strip().split()
+                        if len(vals) >= 3:
+                            pts.append([float(vals[0]), float(vals[1]), float(vals[2])])
+                    except (ValueError, IndexError):
+                        continue
+        
+        points = np.array(pts, dtype=np.float32)
+        if len(points) == 0:
+            print(f"警告：PCD文件 {pcd_path} 没有读取到任何点")
+            return np.zeros((0, 3), dtype=np.float32)
+            
+        # 检查数据有效性
+        if np.isnan(points).any() or np.isinf(points).any():
+            print(f"警告：点云数据中包含 NaN 或 Inf 值")
+            # 移除无效点
+            valid_mask = ~(np.isnan(points).any(axis=1) | np.isinf(points).any(axis=1))
+            points = points[valid_mask]
+            # print(f"清理后的点云数据: shape={points.shape}")
+            
+        return points
+        
+    except Exception as e:
+        print(f"错误：读取PCD文件 {pcd_path} 失败: {str(e)}")
+        return np.zeros((0, 3), dtype=np.float32)
+
+
+
+# def process_chery_camera_params(intrinsics_dir, extrinsics_dir, output_dir):
+#     """
+#     处理 chery 相机内外参，统一保存为 txt 格式
+#     """
+#     # 相机名列表（可根据实际文件夹内容自动获取）
+#     cam_names = [f for f in os.listdir(intrinsics_dir) if f.endswith('.yaml')]
+#     os.makedirs(f"{output_dir}/intrinsics", exist_ok=True)
+#     os.makedirs(f"{output_dir}/extrinsics", exist_ok=True)
+
+#     for cam_yaml in cam_names:
+#         cam_name = cam_yaml.replace('.yaml', '')
+#         # 1. 处理内参
+#         with open(os.path.join(intrinsics_dir, cam_yaml), 'r') as f:
+#             intr = yaml.safe_load(f)
+#         # K: [f_u, f_v, c_u, c_v]
+#         K = intr['K']
+#         # D: [k1, k2, p1, p2] 或更多
+#         D = intr['D']
+#         # 拼接为 [f_u, f_v, c_u, c_v, k1, k2, p1, p2, k3]
+#         # 若 D 长度不足补零
+#         D_pad = D + [0.0] * (5 - len(D))
+#         intr_array = np.array(K + D_pad[:5])
+#         np.savetxt(f"{output_dir}/intrinsics/{cam_name}.txt", intr_array)
+
+#         # 2. 处理外参
+#         extr_path = os.path.join(extrinsics_dir, 'lidar2camera', f'lidar2{cam_name}.yaml')
+#         if os.path.exists(extr_path):
+#             with open(extr_path, 'r') as f:
+#                 extr = yaml.safe_load(f)
+#             # 假设 extr['transform'] 为 4x4 矩阵
+#             if 'transform' in extr:
+#                 extr_array = np.array(extr['transform'])
+#             else:
+#                 # 兼容部分 yaml 格式为 flat list
+#                 extr_array = np.array(extr['data']).reshape(4, 4)
+#             np.savetxt(f"{output_dir}/extrinsics/{cam_name}.txt", extr_array)
+#         else:
+#             print(f"Extrinsics not found for {cam_name}")
+
+
+# IO 操作相关函数
+def save_lidar_data(data: np.ndarray, save_path: str) -> None:
+    """保存LiDAR数据为二进制文件"""
+    data.tofile(save_path)
+
+def save_ego_pose(pose: np.ndarray, save_path: str) -> None:
+    """保存ego位姿"""
+    np.savetxt(save_path, pose)
+
+
+if __name__ == "__main__":
+    # 使用示例
+    chery_clip_dir = "/home/yuhan/yuhan/chery/A车/城市/clip_1717061169799"
+    output_dir = "/home/yuhan/yuhan/gs_test24"
+    # 预处理单个clip
+    preprocess_chery_clip(chery_clip_dir, output_dir)
