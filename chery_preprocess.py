@@ -480,7 +480,8 @@ def read_transform_yaml(yaml_path: str) -> np.ndarray:
             
             # 从四元数创建旋转矩阵
             quat = np.array([rot['x'], rot['y'], rot['z'], rot['w']])
-            R = Rotation.from_quat([quat[3], quat[0], quat[1], quat[2]]).as_matrix()
+            # 这里主要影响副lidar的数据
+            R = Rotation.from_quat([quat[0], quat[1], quat[2], quat[3]]).as_matrix()
             
             # 创建平移向量
             t = np.array([trans['x'], trans['y'], trans['z']])
