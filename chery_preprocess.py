@@ -12,6 +12,17 @@ from scipy.spatial import ConvexHull
 from scipy.spatial.transform import Rotation
 import math
 import cv2
+import hashlib
+
+# Categories configuration for dynamic masks
+# Movable categories include unknown as dynamic; static ones (e.g., cones, barriers) are ignored in masks
+MOVABLE_CATEGORIES = {
+    'car', 'truck', 'bus', 'bicycle', 'motorcycle', 'construction_vehicle',
+    'tricycle', 'person', 'pickup_truck', 'unknown'
+}
+STATIC_CATEGORIES = {'traffic_cone', 'barrier'}
+
+# No fine-grained per-category labels; we only output all/human/vehicle masks.
 def calculate_horizontal_fov105_fx(fx, fy, w=3840, h=2160):
     fov105_radians = 105 / 180 * math.pi
     fov105_fx = w / 2 / math.tan(fov105_radians / 2)
@@ -239,6 +250,10 @@ def get_camera_mapping() -> Dict[str, int]:
     mapping.update(variants)
     return mapping
 
+# Cache fixed per-camera extrinsics (Waymo frame): T_lidar_from_cam
+# Filled in process_camera_params, used in process_ego_pose to write per-frame world-from-cam.
+FIXED_EXTRINSICS: Dict[int, np.ndarray] = {}
+
 def process_camera_params(chery_clip_dir: str, output_dir: str, undistort_fov: float = 60.0):
     """处理相机参数（内参和外参），并计算去畸变参数，返回每个相机的去畸变映射和新内参"""
     import cv2
@@ -311,10 +326,12 @@ def process_camera_params(chery_clip_dir: str, output_dir: str, undistort_fov: f
         if os.path.exists(extr_path):
             extr_array = read_transform_yaml(extr_path)
             extr_array = fix_camera_pose(extr_array)  # 转换到 Waymo 坐标系
-            save_camera_extrinsics(
-                extr_array,
-                os.path.join(output_dir, 'extrinsics', f'{cam_id}.txt')
-            )
+            # save_camera_extrinsics(
+            #     extr_array,
+            #     os.path.join(output_dir, 'extrinsics', f'{cam_id}.txt')
+            # ) do not save lidar coord extrinsics for drivestudio
+            # 记忆固定外参（Waymo坐标系下的 T_lidar_from_cam）
+            FIXED_EXTRINSICS[cam_id] = extr_array
         else:
             print(f"警告: 相机 {cam_id} 的外参文件不存在: {extr_path}")
 
@@ -372,7 +389,7 @@ def process_images(sample_path: str, chery_clip_dir: str, output_dir: str, times
             os.path.join(output_dir, 'images', f'{timestep:03d}_{cam_id}.jpg')
         )
 
-        # 1.2 生成dynamic mask
+    # 1.2 生成 dynamic masks（all/human/vehicle）
         try:
             img_timestamp = int(os.path.basename(img_path).split('_')[1].split('.')[0])
             anno_root = os.path.join(chery_clip_dir, 'annotation')
@@ -381,16 +398,81 @@ def process_images(sample_path: str, chery_clip_dir: str, output_dir: str, times
             anno_files = sorted([f for f in os.listdir(anno_dir) if f.startswith('sample_') and f.endswith('.json')])
             annotations = interpolate_annotations(anno_dir, anno_files, img_timestamp)
             if annotations:
-                dynamic_mask = generate_dynamic_mask(
-                    image.size,
-                    annotations,
-                    cam_id,
-                    chery_clip_dir,
-                    undistort_params=undistort_params
+                # Normalize categories
+                anns_norm = []
+                for a in annotations:
+                    a = dict(a)
+                    if 'category' in a and isinstance(a['category'], str):
+                        a['category'] = a['category'].lower()
+                    anns_norm.append(a)
+
+                # Filters
+                anns_all = [a for a in anns_norm if a.get('category', '') in MOVABLE_CATEGORIES]
+                anns_human = [a for a in anns_norm if a.get('category', '') == 'person']
+                anns_vehicle = [a for a in anns_norm if (a.get('category', '') in MOVABLE_CATEGORIES and a.get('category', '') != 'person')]
+
+                # All movable (binary)
+                if anns_all:
+                    dynamic_mask_all = generate_dynamic_mask(
+                        image.size,
+                        anns_all,
+                        cam_id,
+                        chery_clip_dir,
+                        undistort_params=undistort_params,
+                    )
+                else:
+                    dynamic_mask_all = Image.new('L', image.size, 0)
+                save_image(
+                    dynamic_mask_all,
+                    os.path.join(output_dir, 'dynamic_masks/all', f'{timestep:03d}_{cam_id}.png')
+                )
+
+                # Human-only (binary)
+                if anns_human:
+                    dynamic_mask_human = generate_dynamic_mask(
+                        image.size,
+                        anns_human,
+                        cam_id,
+                        chery_clip_dir,
+                        undistort_params=undistort_params,
+                    )
+                else:
+                    dynamic_mask_human = Image.new('L', image.size, 0)
+                save_image(
+                    dynamic_mask_human,
+                    os.path.join(output_dir, 'dynamic_masks/human', f'{timestep:03d}_{cam_id}.png')
+                )
+
+                # Vehicle-only (binary)
+                if anns_vehicle:
+                    dynamic_mask_vehicle = generate_dynamic_mask(
+                        image.size,
+                        anns_vehicle,
+                        cam_id,
+                        chery_clip_dir,
+                        undistort_params=undistort_params,
+                    )
+                else:
+                    dynamic_mask_vehicle = Image.new('L', image.size, 0)
+                save_image(
+                    dynamic_mask_vehicle,
+                    os.path.join(output_dir, 'dynamic_masks/vehicle', f'{timestep:03d}_{cam_id}.png')
+                )
+
+                # 不输出细分类（仅保留 all / human / vehicle）
+            else:
+                # 没有该帧标注时，也输出默认空掩码，保持文件完备
+                save_image(
+                    Image.new('L', image.size, 0),
+                    os.path.join(output_dir, 'dynamic_masks/all', f'{timestep:03d}_{cam_id}.png')
                 )
                 save_image(
-                    dynamic_mask,
-                    os.path.join(output_dir, 'dynamic_masks', f'{timestep:03d}_{cam_id}.png')
+                    Image.new('L', image.size, 0),
+                    os.path.join(output_dir, 'dynamic_masks/human', f'{timestep:03d}_{cam_id}.png')
+                )
+                save_image(
+                    Image.new('L', image.size, 0),
+                    os.path.join(output_dir, 'dynamic_masks/vehicle', f'{timestep:03d}_{cam_id}.png')
                 )
         except Exception as e:
             print(f"Error generating dynamic mask for {img_path}: {e}")
@@ -585,6 +667,15 @@ def process_ego_pose(chery_clip_dir: str, sample_name: str, output_dir: str,
         pose_mat = convert_pose_dict_to_matrix(pose_dict)
         save_ego_pose(pose_mat, os.path.join(output_dir, 'ego_pose', f'{timestep:03d}.txt'))
 
+        # 生成并保存当前帧的相机外参（从相机到世界，Waymo坐标系）
+        # world_from_cam = world_from_lidar @ lidar_from_cam
+        for cam_id, T_lidar_from_cam in FIXED_EXTRINSICS.items():
+            T_world_from_cam = pose_mat @ T_lidar_from_cam
+            save_camera_extrinsics(
+                T_world_from_cam,
+                os.path.join(output_dir, 'extrinsics', f'{timestep:03d}_{cam_id}.txt')
+            )
+
 def interpolate_pose(ts_pose: List[Tuple[int, np.ndarray]], 
                     sample_name: str) -> Optional[np.ndarray]:
     """根据时间戳插值计算位姿"""
@@ -678,8 +769,21 @@ def preprocess_chery_clip(chery_clip_dir: str, output_dir: str) -> None:
     undistort_params = process_camera_params(chery_clip_dir, output_dir, undistort_fov=71.0)
     # 3. 获取所有sample并按时间戳排序
     sample_dirs = sorted([d for d in os.listdir(chery_clip_dir) if d.startswith('sample_')])
+    # 预先准备标注目录和文件列表（供插值与统计使用）
+    anno_root = os.path.join(chery_clip_dir, 'annotation')
+    anno_dirs = glob.glob(os.path.join(anno_root, '3d_*_object_detection_with_fish_eye'))
+    anno_dir = anno_dirs[0] if anno_dirs else None
+    anno_files = []
+    if anno_dir and os.path.isdir(anno_dir):
+        anno_files = sorted([f for f in os.listdir(anno_dir) if f.startswith('sample_') and f.endswith('.json')])
+
+    # 为 instances 输出做收集
+    frame_instances: Dict[str, List[int]] = {}
+    instances_info: Dict[str, Dict] = {}
+    clip_ns = os.path.basename(chery_clip_dir.rstrip('/'))
+
     # 4. 处理每个时间戳的数据
-    for timestep, sample_name in enumerate(sample_dirs):
+    for timestep, sample_name in enumerate(tqdm(sample_dirs, desc="Frames", unit="frame")):
         # print(f"Processing frame {timestep}: {sample_name}")
         sample_path = os.path.join(chery_clip_dir, sample_name)
         # 4.1 处理图像及相关masks（传入去畸变参数）
@@ -688,6 +792,100 @@ def preprocess_chery_clip(chery_clip_dir: str, output_dir: str) -> None:
         process_lidar(sample_path, chery_clip_dir, output_dir, timestep)
         # 4.3 处理ego位姿
         process_ego_pose(chery_clip_dir, sample_name, output_dir, timestep)
+
+        # 4.4 收集该帧出现的 track_id，并构建反向实例信息
+        try:
+            if anno_dir and anno_files:
+                # 取该帧的时间戳（与 sample_* 的后缀一致）
+                ts = int(sample_name.split('_')[1])
+                annos = interpolate_annotations(anno_dir, anno_files, ts)
+                if annos:
+                    # 当前帧出现的 track_id 列表
+                    tids = []
+                    for obj in annos:
+                        if 'track_id' not in obj:
+                            continue
+                        track_id = obj['track_id']
+                        tids.append(track_id)
+
+                        key = str(track_id)  # 以 track_id 作为实例索引
+                        if key not in instances_info:
+                            # 生成稳定唯一的 hash id（基于 clip 名与 track_id）
+                            uid = hashlib.md5(f"{clip_ns}:{track_id}".encode('utf-8')).hexdigest()
+                            instances_info[key] = {
+                                'id': uid,
+                                'class_name': obj.get('category', ''),
+                                'frame_annotations': {
+                                    'frame_idx': [],
+                                    'obj_to_world': [],
+                                    'box_size': []
+                                }
+                            }
+                        # 追加该帧的标注信息（最小改动：轴对齐到ego，并用已保存的ego位姿映射到world）
+                        center = obj.get('obj_center_pos', [0, 0, 0])
+                        quat = obj.get('obj_rotation', [0, 0, 0, 1])  # [x,y,z,w]
+                        size = obj.get('size', [0, 0, 0])
+
+                        # ==== 替换为与 fix_camera_pose 一致的修正逻辑 ====
+                        # 轴对齐矩阵，保持和 fix_camera_pose 一致
+                        T_fix = np.array([
+                            [0, 0, 1],
+                            [-1, 0, 0],
+                            [0, -1, 0]
+                        ])
+
+                        # 原始 bbox 位姿
+                        R_obj = Rotation.from_quat([quat[0], quat[1], quat[2], quat[3]]).as_matrix()
+                        t_obj = np.array(center, dtype=float)
+
+                        # 修正 bbox 位姿（左乘，和 fix_camera_pose 一致）
+                        R_new = T_fix @ R_obj
+                        t_new = T_fix @ t_obj
+
+                        T_obj_in_ego = np.eye(4)
+                        T_obj_in_ego[:3, :3] = R_new
+                        T_obj_in_ego[:3, 3] = t_new
+
+                        # 读取已保存的本帧ego位姿（world_from_ego）并映射到world
+                        T_obj_to_world = T_obj_in_ego
+                        try:
+                            pose_path_txt = os.path.join(output_dir, 'ego_pose', f'{timestep:03d}.txt')
+                            if os.path.exists(pose_path_txt):
+                                pose_mat = np.loadtxt(pose_path_txt)
+                                if pose_mat.shape == (4, 4):
+                                    T_obj_to_world = pose_mat @ T_obj_in_ego
+                        except Exception:
+                            # 读取失败则保持局部坐标，兼容原行为
+                            pass
+
+                        inst = instances_info[key]['frame_annotations']
+                        inst['frame_idx'].append(timestep)
+                        inst['obj_to_world'].append(T_obj_to_world.tolist())
+                        inst['box_size'].append(size)
+
+                    frame_instances[str(timestep)] = tids
+        except Exception as e:
+            print(f"Error collecting instances for {sample_name}: {e}")
+
+    # 写出 instances 结果
+    try:
+        inst_dir = os.path.join(output_dir, 'instances')
+        os.makedirs(inst_dir, exist_ok=True)
+        with open(os.path.join(inst_dir, 'frame_instances.json'), 'w') as f:
+            json.dump(frame_instances, f)
+        # 将 instances_info 的键（track_id）按数字升序输出
+        if instances_info:
+            try:
+                ordered_keys = sorted((int(k) for k in instances_info.keys()))
+                ordered_instances_info = {str(k): instances_info[str(k)] for k in ordered_keys}
+            except Exception:
+                ordered_instances_info = dict(sorted(instances_info.items(), key=lambda kv: kv[0]))
+        else:
+            ordered_instances_info = instances_info
+        with open(os.path.join(inst_dir, 'instances_info.json'), 'w') as f:
+            json.dump(ordered_instances_info, f)
+    except Exception as e:
+        print(f"Error writing instances outputs: {e}")
 
 def read_pcd_xyz(pcd_path):
     """
@@ -899,6 +1097,6 @@ if __name__ == "__main__":
     # 使用示例
     chery_clip_dir = "/home/yuhan/yuhan/chery/A车/城市/clip_1717055347001"
     # chery_clip_dir = "/home/yuhan/yuhan/chery/B车/城市/clip_1744499330800"
-    output_dir = "./test_gs_chery"
+    output_dir = "./outputs/test_gs_chery"
     # 预处理单个clip
     preprocess_chery_clip(chery_clip_dir, output_dir)
