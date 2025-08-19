@@ -13,6 +13,7 @@ from scipy.spatial.transform import Rotation
 import math
 import cv2
 import hashlib
+from multiprocessing import Pool, cpu_count
 
 # Categories configuration for dynamic masks
 # Movable categories include unknown as dynamic; static ones (e.g., cones, barriers) are ignored in masks
@@ -250,10 +251,6 @@ def get_camera_mapping() -> Dict[str, int]:
     mapping.update(variants)
     return mapping
 
-# Cache fixed per-camera extrinsics (Waymo frame): T_lidar_from_cam
-# Filled in process_camera_params, used in process_ego_pose to write per-frame world-from-cam.
-FIXED_EXTRINSICS: Dict[int, np.ndarray] = {}
-
 def process_camera_params(chery_clip_dir: str, output_dir: str, undistort_fov: float = 60.0):
     """处理相机参数（内参和外参），并计算去畸变参数，返回每个相机的去畸变映射和新内参"""
     import cv2
@@ -326,12 +323,10 @@ def process_camera_params(chery_clip_dir: str, output_dir: str, undistort_fov: f
         if os.path.exists(extr_path):
             extr_array = read_transform_yaml(extr_path)
             extr_array = fix_camera_pose(extr_array)  # 转换到 Waymo 坐标系
-            # save_camera_extrinsics(
-            #     extr_array,
-            #     os.path.join(output_dir, 'extrinsics', f'{cam_id}.txt')
-            # ) do not save lidar coord extrinsics for drivestudio
-            # 记忆固定外参（Waymo坐标系下的 T_lidar_from_cam）
-            FIXED_EXTRINSICS[cam_id] = extr_array
+            save_camera_extrinsics(
+                extr_array,
+                os.path.join(output_dir, 'extrinsics', f'{cam_id}.txt')
+            )
         else:
             print(f"警告: 相机 {cam_id} 的外参文件不存在: {extr_path}")
 
@@ -615,24 +610,24 @@ def convert_to_waymo_format(pts: np.ndarray, trans_mat: np.ndarray,
     
     # 构造Waymo格式数组
     N = pts_trans.shape[0]
-    arr = np.zeros((N, 10), dtype=np.float32)
+    arr = np.zeros((N, 14), dtype=np.float32)
     # origins: LiDAR安装位置
     lidar_origin = trans_mat[:3, 3]
     # arr[:, 0:3] = np.tile(lidar_origin, (N, 1))
     # arr[:, 3:6] = pts_trans  # points
-    # arr[:, 6:10] = 0  # flows
-    # arr[:, 10] = 0  # ground label
-    # arr[:, 11] = 0  # intensity
-    # arr[:, 12] = 0  # elongation
-    # arr[:, 13] = lidar_idx  # laser_id
+    arr[:, 6:10] = 0  # flows
+    arr[:, 10] = 0  # ground label
+    arr[:, 11] = 0  # intensity
+    arr[:, 12] = 0  # elongation
+    arr[:, 13] = lidar_idx  # laser_id
 
     arr[:, 0:3] = pts
     arr[:, 3:6] = pts_trans  # points
     # arr[:, 6:10] = 0  # flows
-    arr[:, 6] = 0  # ground label
-    arr[:, 7] = 0  # intensity
-    arr[:, 8] = 0  # elongation
-    arr[:, 9] = lidar_idx  # laser_id
+    # arr[:, 6] = 0  # ground label
+    # arr[:, 7] = 0  # intensity
+    # arr[:, 8] = 0  # elongation
+    # arr[:, 9] = lidar_idx  # laser_id
     return arr
 
 def process_ego_pose(chery_clip_dir: str, sample_name: str, output_dir: str, 
@@ -666,15 +661,6 @@ def process_ego_pose(chery_clip_dir: str, sample_name: str, output_dir: str,
         pose_dict['position']['z'] += 1.801
         pose_mat = convert_pose_dict_to_matrix(pose_dict)
         save_ego_pose(pose_mat, os.path.join(output_dir, 'ego_pose', f'{timestep:03d}.txt'))
-
-        # 生成并保存当前帧的相机外参（从相机到世界，Waymo坐标系）
-        # world_from_cam = world_from_lidar @ lidar_from_cam
-        for cam_id, T_lidar_from_cam in FIXED_EXTRINSICS.items():
-            T_world_from_cam = pose_mat @ T_lidar_from_cam
-            save_camera_extrinsics(
-                T_world_from_cam,
-                os.path.join(output_dir, 'extrinsics', f'{timestep:03d}_{cam_id}.txt')
-            )
 
 def interpolate_pose(ts_pose: List[Tuple[int, np.ndarray]], 
                     sample_name: str) -> Optional[np.ndarray]:
@@ -756,6 +742,17 @@ def convert_pose_dict_to_matrix(pose_dict):
     return T_waymo
 
 
+def _process_frame_worker(args):
+    """Worker to process a single frame: images, lidar, ego pose."""
+    timestep, sample_name, chery_clip_dir, output_dir, undistort_params = args
+    sample_path = os.path.join(chery_clip_dir, sample_name)
+    # Heavy I/O & CPU tasks (safe to run in parallel as filenames are unique per timestep)
+    process_images(sample_path, chery_clip_dir, output_dir, timestep, undistort_params=undistort_params)
+    process_lidar(sample_path, chery_clip_dir, output_dir, timestep)
+    process_ego_pose(chery_clip_dir, sample_name, output_dir, timestep)
+    return timestep
+
+
 def preprocess_chery_clip(chery_clip_dir: str, output_dir: str) -> None:
     """
     预处理Chery数据集中的单个clip
@@ -782,69 +779,57 @@ def preprocess_chery_clip(chery_clip_dir: str, output_dir: str) -> None:
     instances_info: Dict[str, Dict] = {}
     clip_ns = os.path.basename(chery_clip_dir.rstrip('/'))
 
-    # 4. 处理每个时间戳的数据
-    for timestep, sample_name in enumerate(tqdm(sample_dirs, desc="Frames", unit="frame")):
-        # print(f"Processing frame {timestep}: {sample_name}")
-        sample_path = os.path.join(chery_clip_dir, sample_name)
-        # 4.1 处理图像及相关masks（传入去畸变参数）
-        process_images(sample_path, chery_clip_dir, output_dir, timestep, undistort_params=undistort_params)
-        # 4.2 处理LiDAR点云
-        process_lidar(sample_path, chery_clip_dir, output_dir, timestep)
-        # 4.3 处理ego位姿
-        process_ego_pose(chery_clip_dir, sample_name, output_dir, timestep)
+    # 4.1 重任务并行处理（图像/点云/位姿）
+    tasks = [(i, name, chery_clip_dir, output_dir, undistort_params) for i, name in enumerate(sample_dirs)]
+    with Pool(min(cpu_count(), 8)) as pool:
+        for _ in tqdm(pool.imap_unordered(_process_frame_worker, tasks), total=len(tasks), desc="Frames", unit="frame"):
+            pass
 
-        # 4.4 收集该帧出现的 track_id，并构建反向实例信息
+    # 4.2 串行收集实例信息（确保一致性，避免并发写共享状态）
+    for timestep, sample_name in enumerate(sample_dirs):
         try:
             if anno_dir and anno_files:
-                # 取该帧的时间戳（与 sample_* 的后缀一致）
                 ts = int(sample_name.split('_')[1])
                 annos = interpolate_annotations(anno_dir, anno_files, ts)
                 if annos:
-                    # 当前帧出现的 track_id 列表
                     tids = []
                     for obj in annos:
+                        cat_raw = str(obj.get('category', '')).lower()
+                        if cat_raw in STATIC_CATEGORIES:
+                            continue
+                        mapped_cls = 'Pedestrian' if cat_raw == 'person' else 'Vehicle'
+
                         if 'track_id' not in obj:
                             continue
-                        track_id = obj['track_id']
+                        try:
+                            track_id = int(obj['track_id']) - 1
+                        except Exception:
+                            track_id = obj['track_id']
                         tids.append(track_id)
 
-                        key = str(track_id)  # 以 track_id 作为实例索引
+                        key = str(track_id)
                         if key not in instances_info:
-                            # 生成稳定唯一的 hash id（基于 clip 名与 track_id）
                             uid = hashlib.md5(f"{clip_ns}:{track_id}".encode('utf-8')).hexdigest()
                             instances_info[key] = {
                                 'id': uid,
-                                'class_name': obj.get('category', ''),
+                                'class_name': mapped_cls,
                                 'frame_annotations': {
                                     'frame_idx': [],
                                     'obj_to_world': [],
                                     'box_size': []
                                 }
                             }
-                        # 追加该帧的标注信息（最小改动：轴对齐到ego，并用已保存的ego位姿映射到world）
+
                         center = obj.get('obj_center_pos', [0, 0, 0])
-                        quat = obj.get('obj_rotation', [0, 0, 0, 1])  # [x,y,z,w]
+                        quat = obj.get('obj_rotation', [0, 0, 0, 1])
                         size = obj.get('size', [0, 0, 0])
 
-                        # ==== 替换为与 fix_camera_pose 一致的修正逻辑 ====
-                        # 轴对齐矩阵，保持和 fix_camera_pose 一致
-                        T_fix = np.array([
-                            [0, 0, 1],
-                            [-1, 0, 0],
-                            [0, -1, 0]
-                        ])
-
-                        # 原始 bbox 位姿
                         R_obj = Rotation.from_quat([quat[0], quat[1], quat[2], quat[3]]).as_matrix()
                         t_obj = np.array(center, dtype=float)
 
-                        # 修正 bbox 位姿（左乘，和 fix_camera_pose 一致）
-                        R_new = T_fix @ R_obj
-                        t_new = T_fix @ t_obj
-
                         T_obj_in_ego = np.eye(4)
-                        T_obj_in_ego[:3, :3] = R_new
-                        T_obj_in_ego[:3, 3] = t_new
+                        T_obj_in_ego[:3, :3] = R_obj
+                        T_obj_in_ego[:3, 3] = t_obj
 
                         # 读取已保存的本帧ego位姿（world_from_ego）并映射到world
                         T_obj_to_world = T_obj_in_ego
@@ -867,23 +852,46 @@ def preprocess_chery_clip(chery_clip_dir: str, output_dir: str) -> None:
         except Exception as e:
             print(f"Error collecting instances for {sample_name}: {e}")
 
-    # 写出 instances 结果
+    # 写出 instances 结果（对实例进行连续重映射，确保两份 JSON 一致，且从 0 开始）
     try:
         inst_dir = os.path.join(output_dir, 'instances')
         os.makedirs(inst_dir, exist_ok=True)
-        with open(os.path.join(inst_dir, 'frame_instances.json'), 'w') as f:
-            json.dump(frame_instances, f)
-        # 将 instances_info 的键（track_id）按数字升序输出
+
+        # 1) 构建 old_id -> new_id 的连续映射
         if instances_info:
-            try:
-                ordered_keys = sorted((int(k) for k in instances_info.keys()))
-                ordered_instances_info = {str(k): instances_info[str(k)] for k in ordered_keys}
-            except Exception:
-                ordered_instances_info = dict(sorted(instances_info.items(), key=lambda kv: kv[0]))
+            ordered_old_ids = sorted(int(k) for k in instances_info.keys())
+            id_map = {old_id: new_id for new_id, old_id in enumerate(ordered_old_ids)}
+
+            # 2) 重映射 instances_info 到新 ID（键与内部 'id' 字段）
+            remapped_instances_info: Dict[str, Dict] = {}
+            for old_id in ordered_old_ids:
+                old_key = str(old_id)
+                new_id = id_map[old_id]
+                item = dict(instances_info[old_key])
+                # 使用新的连续 ID，保持简洁
+                item['id'] = new_id
+                remapped_instances_info[str(new_id)] = item
+
+            # 3) 重映射 frame_instances 中的 track 列表
+            remapped_frame_instances: Dict[str, List[int]] = {}
+            for frame_key, tids in frame_instances.items():
+                new_tids: List[int] = []
+                for tid in tids:
+                    try:
+                        new_tids.append(id_map[int(tid)])
+                    except Exception:
+                        # 若某些 tid 不在映射中（理论上不会发生，因为已过滤），则忽略
+                        continue
+                remapped_frame_instances[frame_key] = new_tids
         else:
-            ordered_instances_info = instances_info
+            remapped_instances_info = instances_info
+            remapped_frame_instances = frame_instances
+
+        # 4) 写文件
+        with open(os.path.join(inst_dir, 'frame_instances.json'), 'w') as f:
+            json.dump(remapped_frame_instances, f)
         with open(os.path.join(inst_dir, 'instances_info.json'), 'w') as f:
-            json.dump(ordered_instances_info, f)
+            json.dump(remapped_instances_info, f)
     except Exception as e:
         print(f"Error writing instances outputs: {e}")
 
@@ -1097,6 +1105,6 @@ if __name__ == "__main__":
     # 使用示例
     chery_clip_dir = "/home/yuhan/yuhan/chery/A车/城市/clip_1717055347001"
     # chery_clip_dir = "/home/yuhan/yuhan/chery/B车/城市/clip_1744499330800"
-    output_dir = "./outputs/test_gs_chery"
+    output_dir = "./outputs_unfixed/010"
     # 预处理单个clip
     preprocess_chery_clip(chery_clip_dir, output_dir)
