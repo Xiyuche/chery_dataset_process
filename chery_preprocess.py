@@ -1183,8 +1183,8 @@ if __name__ == "__main__":
     #     pool.map(process_one_clip, clips)
     # print("所有clips处理完成！")
     # 使用示例
-    chery_clip_dir = "/home/yuhan/yuhan/chery/A车/城市/clip_1717055347001"
+    chery_clip_dir = "/mnt/public/AISIM/yuchen/repos/cherry-dataset/A车/城市/clip_1717060149699"
     # chery_clip_dir = "/home/yuhan/yuhan/chery/B车/城市/clip_1744499330800"
-    output_dir = "./zero/ego_pose_rev/013"
+    output_dir = "./zero/final/000"
     # 预处理单个clip
     preprocess_chery_clip(chery_clip_dir, output_dir)
