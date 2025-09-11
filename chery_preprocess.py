@@ -95,8 +95,8 @@ def save_camera_extrinsics(extrinsics: np.ndarray, path: str) -> None:
 def create_output_dirs(output_dir: str) -> None:
     """创建输出目录结构"""
     subdirs = [
-        'images', 'lidar', 'ego_pose', 'extrinsics',
-        'intrinsics', 'dynamic_masks', 'sky_masks'
+    'images', 'lidar', 'ego_pose', 'extrinsics',
+    'intrinsics', 'dynamic_masks', 'lidar_debug'
     ]
     for subdir in subdirs:
         os.makedirs(os.path.join(output_dir, subdir), exist_ok=True)
@@ -118,7 +118,7 @@ def interpolate_annotations(anno_dir: str, anno_files: List[str], target_ts: int
             if 'annotated_info' in anno and '3d_object_detection_info' in anno['annotated_info']:
                 ts_list.append(ts)
                 anno_list.append(anno['annotated_info']['3d_object_detection_info']['3d_object_detection_anns_info'])
-        except Exception as e:
+        except Exception as e:         
             print(f"Error reading annotation file {anno_file}: {e}")
             continue
     if not ts_list:
@@ -527,6 +527,16 @@ def process_lidar(sample_path: str, chery_clip_dir: str, output_dir: str,
             combined_data = np.concatenate(lidar_data, axis=0)
             save_path = os.path.join(output_dir, 'lidar', f'{timestep:03d}.bin')
             save_lidar_data(combined_data, save_path)
+            # 同步输出调试用 PLY（仅 xyz ）
+            try:
+                debug_dir = os.path.join(output_dir, 'lidar_debug')
+                os.makedirs(debug_dir, exist_ok=True)
+                ply_path = os.path.join(debug_dir, f'{timestep:03d}.ply')
+                # combined_data 列 3:6 为点坐标 (x,y,z)
+                points_xyz = combined_data[:, 3:6]
+                save_point_cloud_ply(points_xyz, ply_path)
+            except Exception as e:
+                print(f"保存调试PLY失败: {e}")
             # print(f"保存数据到: {save_path}")
         except Exception as e:
             print(f"保存合并数据时出错: {str(e)}")
@@ -557,7 +567,8 @@ def read_transform_yaml(yaml_path: str) -> np.ndarray:
             
             # 从四元数创建旋转矩阵
             quat = np.array([rot['x'], rot['y'], rot['z'], rot['w']])
-            R = Rotation.from_quat([quat[3], quat[0], quat[1], quat[2]]).as_matrix()
+            # 这里主要影响副lidar的数据
+            R = Rotation.from_quat([quat[0], quat[1], quat[2], quat[3]]).as_matrix()
             
             # 创建平移向量
             t = np.array([trans['x'], trans['y'], trans['z']])
@@ -576,6 +587,21 @@ def read_transform_yaml(yaml_path: str) -> np.ndarray:
         
     return transform
 
+def imu2vehicle() -> np.ndarray:
+     """Compute IMU->Vehicle transform.
+
+     Assumptions per spec:
+     1) Rotate axes: right-x, front-y, up-z (IMU) -> front-x, left-y, up-z (Vehicle)
+         by a -90 degree rotation about Z.
+     2) Translate Z down to the ground by approximate wheel radius (0.35m).
+     """
+     from scipy.spatial.transform import Rotation as R
+     T = np.eye(4)
+     r = R.from_euler('z', -90, degrees=True)
+     T[:3, :3] = r.as_matrix()
+     T[2, 3] = 0.35
+     return T
+
 def get_lidar_transform(chery_clip_dir: str, lidar_idx: int) -> np.ndarray:
     """获取LiDAR到主LiDAR的转换矩阵"""
     # 主LiDAR返回单位矩阵
@@ -584,8 +610,8 @@ def get_lidar_transform(chery_clip_dir: str, lidar_idx: int) -> np.ndarray:
     
     # 根据索引获取对应的LiDAR名称
     lidar_names = {
-        1: 'front',
-        2: 'left',
+        1: 'left',
+        2: 'front',
         3: 'right'
     }
     
@@ -613,16 +639,16 @@ def convert_to_waymo_format(pts: np.ndarray, trans_mat: np.ndarray,
     arr = np.zeros((N, 14), dtype=np.float32)
     # origins: LiDAR安装位置
     lidar_origin = trans_mat[:3, 3]
-    # arr[:, 0:3] = np.tile(lidar_origin, (N, 1))
-    # arr[:, 3:6] = pts_trans  # points
+    arr[:, 0:3] = np.tile(lidar_origin, (N, 1))
+    arr[:, 3:6] = pts_trans  # points
     arr[:, 6:10] = 0  # flows
     arr[:, 10] = 0  # ground label
     arr[:, 11] = 0  # intensity
     arr[:, 12] = 0  # elongation
     arr[:, 13] = lidar_idx  # laser_id
 
-    arr[:, 0:3] = pts
-    arr[:, 3:6] = pts_trans  # points
+    # arr[:, 0:3] = pts
+    # arr[:, 3:6] = pts_trans  # points
     # arr[:, 6:10] = 0  # flows
     # arr[:, 6] = 0  # ground label
     # arr[:, 7] = 0  # intensity
@@ -630,45 +656,53 @@ def convert_to_waymo_format(pts: np.ndarray, trans_mat: np.ndarray,
     # arr[:, 9] = lidar_idx  # laser_id
     return arr
 
-def process_ego_pose(chery_clip_dir: str, sample_name: str, output_dir: str, 
+def process_ego_pose(chery_clip_dir: str, sample_name: str, output_dir: str,
                     timestep: int) -> None:
-    """处理ego位姿数据"""
+    """Compute and save mainlidar2world using original localization interpolation.
+
+    mainlidar2world = vehicle2world (from localization) @ (imu2vehicle() @ lidar2imu)
+    """
     pose_path = os.path.join(chery_clip_dir, 'localization.json')
     if not os.path.exists(pose_path):
         return
-        
+
     with open(pose_path, 'r') as f:
         poses = json.load(f)
-    # import pdb; pdb.set_trace() 
-    # 确保poses是列表
+
+    # Keep original handling: list or dict['poses']
     if not isinstance(poses, list):
         if 'poses' in poses:
             poses = poses['poses']
         else:
             print(f"Warning: Unexpected format in {pose_path}")
             return
-    
-    # 获取时间戳对应的位姿（dict格式）
+
+    # (timestamp, pose_dict)
     ts_pose = [(p["timestamp"], p["pose"]) for p in poses if "timestamp" in p and "pose" in p]
     if not ts_pose:
         print(f"No valid pose in {pose_path}")
         return
-    # 处理时间戳和插值
+
+    # Use original interpolation logic
     pose_dict = interpolate_pose(ts_pose, sample_name)
-    
-    if pose_dict is not None:
-        # 转换为Waymo格式4x4矩阵
-        pose_dict['position']['z'] += 1.801
-        pose_mat = convert_pose_dict_to_matrix(pose_dict)
-        save_ego_pose(pose_mat, os.path.join(output_dir, 'ego_pose', f'{timestep:03d}.txt'))
+    if pose_dict is None:
+        return
+
+    # Compose vehicle2world and lidar2vehicle
+    # v2w = _pose_dict_to_matrix(pose_dict)
+    v2w = convert_pose_dict_to_matrix(pose_dict)
+    lidar2imu_path = os.path.join(chery_clip_dir, 'extrinsics', 'lidar2imu', 'lidar2imu.yaml')
+    lidar2imu = read_transform_yaml(lidar2imu_path)
+    l2v = imu2vehicle() @ lidar2imu
+    mainlidar2world = v2w @ l2v
+    save_ego_pose(mainlidar2world, os.path.join(output_dir, 'ego_pose', f'{timestep:03d}.txt'))
 
 def interpolate_pose(ts_pose: List[Tuple[int, np.ndarray]], 
                     sample_name: str) -> Optional[np.ndarray]:
-    """根据时间戳插值计算位姿"""
+    """根据时间戳插值计算位姿（保留原始实现）"""
     try:
         sample_ts = int(sample_name.split('_')[1])
         sample_ts = sample_ts / 1000000.0  # 转换为秒
-        # print(f"Processing timestamp: {sample_ts}")
     except (IndexError, ValueError):
         print(f"Warning: 无法解析时间戳 {sample_name}，使用第一个位姿")
         return ts_pose[0][1]  # 无法解析时间戳，返回第一个位姿
@@ -702,9 +736,25 @@ def interpolate_pose(ts_pose: List[Tuple[int, np.ndarray]],
         return pose_interp
     return prev[1] if prev else next[1] if next else ts_sorted[0][1]
 
+
+
+def _pose_dict_to_matrix(pose_dict: dict) -> np.ndarray:
+    """Convert pose dict to 4x4 matrix directly.
+
+    Assumes pose_dict already represents vehicle2world in the target coordinate frame.
+    """
+    from scipy.spatial.transform import Rotation as R
+    pos = pose_dict['position']
+    quat = pose_dict['orientation']
+    T = np.eye(4)
+    T[:3, :3] = R.from_quat([
+        quat['qx'], quat['qy'], quat['qz'], quat['qw']
+    ]).as_matrix()
+    T[:3, 3] = [pos['x'], pos['y'], pos['z']]
+    return T
+
 import numpy as np
 from scipy.spatial.transform import Rotation
-
 def convert_pose_dict_to_matrix(pose_dict):
     """
     将 UTM 坐标系下的 pose dict 转换为 Waymo 坐标系下的 4x4 变换矩阵。
@@ -729,7 +779,7 @@ def convert_pose_dict_to_matrix(pose_dict):
     # ENU (E, N, U) → Waymo (F, L, U) ≈ Waymo (N, -E, U)
     R_axis = np.array([
         [ 0,  1, 0],
-        [1,  0, 0],
+        [-1,  0, 0],
         [ 0,  0, 1]
     ])  # 3x3
 
@@ -1085,6 +1135,36 @@ def save_ego_pose(pose: np.ndarray, save_path: str) -> None:
     """保存ego位姿"""
     np.savetxt(save_path, pose)
 
+def save_point_cloud_ply(points: np.ndarray, save_path: str) -> None:
+    """保存点云为简单ASCII PLY文件 (N x 3)."""
+    if points.size == 0:
+        # 仍然写一个空的 PLY 头，方便调试
+        header = [
+            'ply',
+            'format ascii 1.0',
+            'element vertex 0',
+            'property float x',
+            'property float y',
+            'property float z',
+            'end_header'\
+        ]
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, 'w') as f:
+            f.write('\n'.join(header))
+        return
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    with open(save_path, 'w') as f:
+        f.write('ply\n')
+        f.write('format ascii 1.0\n')
+        f.write(f'element vertex {points.shape[0]}\n')
+        f.write('property float x\n')
+        f.write('property float y\n')
+        f.write('property float z\n')
+        f.write('end_header\n')
+        # 写入点
+        for p in points:
+            f.write(f'{p[0]} {p[1]} {p[2]}\n')
+
 
 if __name__ == "__main__":
     # from multiprocessing import Pool, cpu_count
@@ -1105,6 +1185,6 @@ if __name__ == "__main__":
     # 使用示例
     chery_clip_dir = "/home/yuhan/yuhan/chery/A车/城市/clip_1717055347001"
     # chery_clip_dir = "/home/yuhan/yuhan/chery/B车/城市/clip_1744499330800"
-    output_dir = "./outputs_unfixed/010"
+    output_dir = "./zero/ego_pose_rev/013"
     # 预处理单个clip
     preprocess_chery_clip(chery_clip_dir, output_dir)
