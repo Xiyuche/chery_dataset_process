@@ -170,5 +170,24 @@ Potential extensions:
 ## 8. License
 (Insert your license or usage terms here.)
 
+## 9. Extrinsics Only Quick Tool
+If you only need the camera extrinsics (Waymo frame adjusted) without running the full preprocessing pipeline, use:
+
+```
+python chery_extrinsics_only.py \
+  --clip /path/to/clip_1717055347001 \
+  --out ./extrinsics_out
+```
+
+This creates:
+```
+extrinsics_out/
+  extrinsics/
+    0.txt
+    1.txt
+    ...
+```
+Each file is a 4x4 float matrix (lidar->camera) after the same orientation fix as the full pipeline (`fix_camera_pose`). Missing cameras are skipped with a warning. Existing files are overwritten.
+
 ---
 Questions / improvements welcome.

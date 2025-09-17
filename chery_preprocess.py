@@ -1167,24 +1167,48 @@ def save_point_cloud_ply(points: np.ndarray, save_path: str) -> None:
 
 
 if __name__ == "__main__":
-    # from multiprocessing import Pool, cpu_count
-    # chery_clip_root = "/home/yuhan/yuhan/chery/A车/高速"
-    # output_root = "/home/yuhan/yuhan/chery_gs6"
-    # clips = [clip_name for clip_name in os.listdir(chery_clip_root) if clip_name.startswith('clip_')]
+    """最简运行示例 (手动改路径即可):
+    1. 设置 ROOT_DIR 为含多个 clip_* 目录的根路径
+    2. 设置 OUT_ROOT 为输出根目录
+    3. 直接: python chery_preprocess.py
 
-    # def process_one_clip(clip_name):
-    #     chery_clip_dir = os.path.join(chery_clip_root, clip_name)
-    #     output_dir = os.path.join(output_root, clip_name)
-    #     print(f"Processing clip: {chery_clip_dir} -> {output_dir}")
-    #     preprocess_chery_clip(chery_clip_dir, output_dir)
-    #     print(f"Finished processing clip: {chery_clip_dir} -> {output_dir}")
+    会生成: OUT_ROOT/000, OUT_ROOT/001, ... 及 OUT_ROOT/clip_index_map.csv
+    CSV: index,clip_name
+    """
+    # --- 用户需修改的两个路径 ---
+    ROOT_DIR = "/mnt/public/AISIM/yuchen/repos/cherry-dataset/A车/城市"   # 例: 包含 clip_1744... 等目录
+    OUT_ROOT = "./A车/城市"          # 输出根目录
 
-    # with Pool(min(cpu_count(), 16)) as pool:
-    #     pool.map(process_one_clip, clips)
-    # print("所有clips处理完成！")
-    # 使用示例
-    chery_clip_dir = "/mnt/public/AISIM/yuchen/repos/cherry-dataset/A车/城市/clip_1717060149699"
-    # chery_clip_dir = "/home/yuhan/yuhan/chery/B车/城市/clip_1744499330800"
-    output_dir = "./zero/final/000"
-    # 预处理单个clip
-    preprocess_chery_clip(chery_clip_dir, output_dir)
+    os.makedirs(OUT_ROOT, exist_ok=True)
+
+    # 收集并排序 clip 目录
+    clip_names = sorted([d for d in os.listdir(ROOT_DIR) if d.startswith('clip_') and os.path.isdir(os.path.join(ROOT_DIR, d))])
+    if not clip_names:
+        print("无 clip_* 目录, 结束")
+        sys.exit(0)
+
+    # 定义任务
+    tasks = [(i, name, ROOT_DIR, OUT_ROOT) for i, name in enumerate(clip_names)]
+
+    def process_clip(task):
+        idx, name, root_dir, out_root = task
+        idx = f"{idx:03d}"
+        src = os.path.join(root_dir, name)
+        dst = os.path.join(out_root, idx)
+        print(f"[{idx}] {name}")
+        preprocess_chery_clip(src, dst)  # 出错直接抛出, 便于发现问题
+        return idx, name
+
+    # 串行处理 clip，保留 tqdm
+    from tqdm import tqdm
+    mapping_rows = []
+    for task in tqdm(tasks, desc="Clips", unit="clip"):
+        mapping_rows.append(process_clip(task))
+
+    # 写 CSV
+    import csv
+    with open(os.path.join(OUT_ROOT, 'clip_index_map.csv'), 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['index', 'clip_name'])
+        w.writerows(mapping_rows)
+    print("完成, 映射文件: clip_index_map.csv")
